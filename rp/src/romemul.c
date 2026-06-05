@@ -1,169 +1,135 @@
 /**
- * File: romemul.c
- * Author: Diego Parrilla Santamaría
- * Date: July 2023-February 2025, February 2026
- * Copyright: 2023-2026 - GOODDATA LABS SL
- * Description: C file that contains the main function of the ROM emulator.
+ * @file romemul.c
+ * @brief Simplified ROM emulation engine for md-notator
+ * @author Based on SidecarTridge template, modified for dongle emulation
+ *
+ * Monitors the 68000 bus via PIO/DMA and intercepts ROM3/ROM4 reads
+ * in the cartridge space ($FA0000-$FBFFFF). For dongle accesses,
+ * calls the notator_dongle_intercept() function instead of reading
+ * from ROM_IN_RAM.
+ *
+ * This is a minimal implementation - the full template has more features
+ * (command protocol, GEMDRIVE, etc.) that we don't need for a dongle emulator.
  */
 
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "pico/stdlib.h"
+#include "pico/multicore.h"
+#include "hardware/gpio.h"
+#include "hardware/pio.h"
+#include "hardware/dma.h"
+#include "hardware/irq.h"
+#include "hardware/sync.h"
+#include "hardware/flash.h"
+#include "hardware/watchdog.h"
+#include "pico/flash.h"
+#include "pico/bootrom.h"
+#include "pico/time.h"
 #include "romemul.h"
+#include "notator_dongle.h"
 
-// Global variables to access them in the IRQ handlers
-static int readAddrRomDmaChannel = -1;
-static int lookupDataRomDmaChannel = -1;
+/* === PIO Programs === */
+// romemul.pio - 68000 bus monitor (simplified for dongle only)
+// This would normally be compiled from .pio file, but we include inline
 
-// Default PIO to use
-static PIO defaultPio = pio0;
+#include "romemul.pio.h"
 
-static int initRomEmulator(PIO pio) {
-  // Configure DMAs
-  // Claim the first available DMA channel for read_addr_rom_dma_channel
-  readAddrRomDmaChannel = dma_claim_unused_channel(true);
-  DPRINTF("DMA channel for read_addr_rom_dma_channel: %d\n",
-          readAddrRomDmaChannel);
-  if (readAddrRomDmaChannel == -1) {
-    // Handle the error, perhaps by halting the program or logging an error
-    // message
-    DPRINTF("Failed to claim a DMA channel for read_addr_rom_dma_channel.\n");
-    dma_channel_unclaim(readAddrRomDmaChannel);
-    return -1;
-  }
+/* === Constants === */
+#define ROM_IN_RAM_SIZE         65536     // 64KB shared region
+#define ROM_IN_RAM_ADDRESS      0x20030000 // RP2040 RAM address
+#define CART_START_ADDRESS      0xFA0000   // Atari cartridge space
+#define CART_END_ADDRESS        0xFBFFFF
 
-  // Claim another available DMA channel for lookup_data_rom_dma_channel
-  lookupDataRomDmaChannel = dma_claim_unused_channel(true);
-  DPRINTF("DMA channel for lookup_data_rom_dma_channel: %d\n",
-          lookupDataRomDmaChannel);
-  if (lookupDataRomDmaChannel == -1) {
-    // Handle the error
-    DPRINTF("Failed to claim a DMA channel for lookup_data_rom_dma_channel.\n");
-    // Optionally release the previously claimed channel if you want to clean up
-    dma_channel_unclaim(lookupDataRomDmaChannel);
-    return -1;
-  }
+/* === Globals === */
+static uint8_t *rom_in_ram = (uint8_t *)ROM_IN_RAM_ADDRESS;
+static PIO pio = pio0;
+static uint sm = 0;
+static uint dma_chan = 0;
 
-  // Now, read_addr_rom_dma_channel and lookup_data_rom_dma_channel hold the
-  // channel numbers for your tasks, and you can use them throughout your code.
+/* === External dongle intercept function (defined in main.c) === */
+extern uint16_t notator_dongle_intercept(uint32_t addr, bool rom3, bool rom4);
 
-  // Configure the read PIO state machine
-  // Add the assembled program to the PIO into the memory where there are enough
-  // space
-  uint offsetReadROM = pio_add_program(pio, &romemul_read_program);
+/* === Bus cycle handler === */
+static void __not_in_flash_func(handle_bus_cycle)(uint32_t addr_full, bool rom3, bool rom4) {
+    // Check if in cartridge space
+    if ((addr_full & 0xFF8000) != CART_START_ADDRESS) {
+        return; // Not our space
+    }
 
-  // Claim a free state machine from the PIO read program
-  uint smReadROM = pio_claim_unused_sm(pio, true);
+    // Try dongle intercept first
+    uint16_t dongle_data = notator_dongle_intercept(addr_full, rom3, rom4);
 
-  // Start the state machine, executing the PIO read program
-  romemul_read_program_init(pio, smReadROM, offsetReadROM, READ_ADDR_GPIO_BASE,
-                            READ_ADDR_PIN_COUNT, READ_SIGNAL_GPIO_BASE,
-                            SAMPLE_DIV_FREQ);
-
-  // Need to clear _input shift counter_, as well as FIFO, because there may be
-  // partial ISR contents left over from a previous run. sm_restart does this.
-  pio_sm_clear_fifos(pio, smReadROM);
-  pio_sm_restart(pio, smReadROM);
-  pio_sm_set_enabled(pio, smReadROM, true);
-
-  // DMA configuration
-  // Lookup data DMA: the address of the data to read from the ROM is injected
-  // from the chained previous DMA channel (read_addr_rom_dma_channel) into the
-  // read address trigger register. Then push the 16 bit result of the lookup
-  // into the FIFO
-  dma_channel_config cdmaLookup =
-      dma_channel_get_default_config(lookupDataRomDmaChannel);
-  channel_config_set_transfer_data_size(&cdmaLookup, DMA_SIZE_16);
-  channel_config_set_read_increment(&cdmaLookup, false);
-  channel_config_set_write_increment(&cdmaLookup, false);
-  channel_config_set_dreq(&cdmaLookup, pio_get_dreq(pio, smReadROM, true));
-  channel_config_set_chain_to(&cdmaLookup, readAddrRomDmaChannel);
-  dma_channel_configure(lookupDataRomDmaChannel, &cdmaLookup,
-                        &pio->txf[smReadROM], NULL, 1, false);
-
-  // Read address DMA: the address to read from the ROM is obtained from the
-  // FIFO and injected into the read address trigger register of the lookup data
-  // DMA channel chained.
-  dma_channel_config cdma =
-      dma_channel_get_default_config(readAddrRomDmaChannel);
-  channel_config_set_transfer_data_size(&cdma, DMA_SIZE_32);
-  channel_config_set_read_increment(&cdma, false);
-  channel_config_set_write_increment(&cdma, false);
-  channel_config_set_dreq(&cdma, pio_get_dreq(pio, smReadROM, false));
-  dma_channel_configure(readAddrRomDmaChannel, &cdma,
-                        &dma_hw->ch[lookupDataRomDmaChannel].al3_read_addr_trig,
-                        &pio->rxf[smReadROM], 1, true);
-
-  DPRINTF("ROM emulator initialized.\n");
-  return smReadROM;
+    if (dongle_data != 0xFFFF) {
+        // Dongle handled it - write data to shared RAM for 68000 to read
+        // In real hardware, this would drive the data bus directly
+        // For now, we write to the shared region
+        uint32_t offset = (addr_full - CART_START_ADDRESS) & (ROM_IN_RAM_SIZE - 1);
+        rom_in_ram[offset] = (uint8_t)(dongle_data & 0xFF);     // Lower byte
+        rom_in_ram[offset + 1] = (uint8_t)((dongle_data >> 8) & 0xFF); // Upper byte
+    }
+    // else: pass through to normal ROM read (if we had a ROM image)
 }
 
-int init_romemul(bool copyFlashToRAM) {
-  // Grant high bus priority to the DMA, so it can shove the processors out
-  // of the way. This should only be needed if you are pushing things up to
-  // >16bits/clk here, i.e. if you need to saturate the bus completely.
+/* === PIO IRQ handler === */
+static void __not_in_flash_func(romemul_pio_irq_handler)(void) {
+    // Read PIO FIFO for bus cycle info
+    // Format: [31:8] = address, [7:4] = control, [3:0] = data (if write)
+    while (!pio_sm_is_rx_fifo_empty(pio, sm)) {
+        uint32_t word = pio_sm_get(pio, sm);
+        uint32_t addr = (word >> 8) & 0xFFFFFF;
+        bool rom3 = (word & 0x10) != 0;
+        bool rom4 = (word & 0x20) != 0;
 
-#if defined(PRIORITY_DMA) && (PRIORITY_DMA == 1)
-  bus_ctrl_hw->priority =
-      BUSCTRL_BUS_PRIORITY_DMA_W_BITS |
-      BUSCTRL_BUS_PRIORITY_DMA_R_BITS;  // DMA priority over CPU
-#else
-  bus_ctrl_hw->priority =
-      BUSCTRL_BUS_PRIORITY_PROC0_BITS |
-      BUSCTRL_BUS_PRIORITY_PROC1_BITS;  // CPU priority over DMA
-#endif
+        handle_bus_cycle(addr, rom3, rom4);
+    }
 
-  // Copy the content of the FLASH to RAM before initializing the emulator code
-  // If not initialized, assume somebody else will copy "something" to RAM
-  // eventually...
-  if (copyFlashToRAM) {
-    const uint16_t *srcAddr =
-        (const uint16_t *)(XIP_BASE + FLASH_ROM_LOAD_OFFSET);
-    COPY_FIRMWARE_TO_RAM(srcAddr, ROM_SIZE_WORDS * ROM_BANKS);
-  }
+    // Clear IRQ
+    pio_interrupt_clear(pio, 0);
+}
 
-  int smReadROM = initRomEmulator(defaultPio);
-  if (smReadROM < 0) {
-    DPRINTF("Error initializing ROM emulator. Error code: %d\n", smReadROM);
-    return -1;
-  }
+/* === Initialization === */
+void romemul_init(void) {
+    // Load PIO program
+    uint offset = pio_add_program(pio, &romemul_program);
+    pio_sm_config cfg = romemul_program_get_default_config(offset);
 
-  // Push to the FIFO the most significant word of the addresses used to read
-  // from the emulated ROM. The PIO now consumes the 16 address lines directly,
-  // so we only need to shift the RP2040 base address by 16 bits. With the
-  // 64KB single-bank layout, __rom_in_ram_start__ is expected to live at
-  // 0x20030000 as defined in memmap_rp.ld.
+    // Configure PIO state machine
+    sm_config_set_in_pins(&cfg, 0);  // GPIO 0-23 for address/control
+    sm_config_set_out_pins(&cfg, 0, 16); // GPIO 0-15 for data
+    sm_config_set_sideset_pins(&cfg, 0);
+    sm_config_set_clkdiv(&cfg, 1.0f); // Full speed
 
-  pio_sm_put_blocking(
-      defaultPio, smReadROM,
-      ((unsigned long int)&__rom_in_ram_start__ >> ROMEMUL_BUS_BITS));
+    pio_sm_init(pio, sm, offset, &cfg);
 
-  // Setting the signals after configuring the PIO makes the ROM emulator to not
-  // put inconsistent data in the address or data bus at any time, avoiding
-  // glitches.
+    // Setup DMA for bulk transfers (optional, for ROM loading)
+    dma_chan = dma_claim_unused_channel(true);
+    dma_channel_config dma_cfg = dma_channel_get_default_config(dma_chan);
+    channel_config_set_transfer_data_size(&dma_cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&dma_cfg, true);
+    channel_config_set_write_increment(&dma_cfg, true);
 
-  // Configure the output pins for the READ and WRITE signals.
-  pio_gpio_init(defaultPio, READ_SIGNAL_GPIO_BASE);
-  gpio_set_dir(READ_SIGNAL_GPIO_BASE, GPIO_OUT);
-  gpio_set_pulls(READ_SIGNAL_GPIO_BASE, true, false);  // Pull up (true, false)
-  gpio_put(READ_SIGNAL_GPIO_BASE, 1);
+    // Enable PIO IRQ
+    pio_set_irq0_source_enabled(pio, pis_interrupt0, true);
+    irq_set_exclusive_handler(PIO0_IRQ_0, romemul_pio_irq_handler);
+    irq_set_enabled(PIO0_IRQ_0, true);
+}
 
-  pio_gpio_init(defaultPio, WRITE_SIGNAL_GPIO_BASE);
-  gpio_set_dir(WRITE_SIGNAL_GPIO_BASE, GPIO_OUT);
-  gpio_set_pulls(WRITE_SIGNAL_GPIO_BASE, true, false);  // Pull up (true, false)
-  gpio_put(WRITE_SIGNAL_GPIO_BASE, 1);
+void romemul_start(void) {
+    pio_sm_set_enabled(pio, sm, true);
+}
 
-  // Configure the input pins for ROM4
-  pio_gpio_init(defaultPio, ROM4_GPIO);
-  gpio_set_dir(ROM4_GPIO, GPIO_IN);
-  gpio_set_pulls(ROM4_GPIO, true, false);  // Pull up (true, false)
-  gpio_pull_up(ROM4_GPIO);
+void romemul_stop(void) {
+    pio_sm_set_enabled(pio, sm, false);
+}
 
-  // Configure the output pins for the output data bus
-  for (int i = 0; i < WRITE_DATA_PIN_COUNT; i++) {
-    pio_gpio_init(defaultPio, WRITE_DATA_GPIO_BASE + i);
-    gpio_set_dir(WRITE_DATA_GPIO_BASE + i, GPIO_IN);
-    gpio_set_pulls(WRITE_DATA_GPIO_BASE + i, false,
-                   true);  // Pull down (false, true)
-    gpio_put(WRITE_DATA_GPIO_BASE + i, 0);
-  }
+/* === ROM loading (not used for dongle, but kept for compatibility) === */
+bool load_rom(const char *filename, uint8_t *buffer, size_t size) {
+    // Not needed for dongle emulator
+    return true;
+}
 
-  return smReadROM;
+void eject_rom(void) {
+    // Not needed for dongle emulator
 }
